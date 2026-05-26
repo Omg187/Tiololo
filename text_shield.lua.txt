@@ -1,5 +1,3 @@
--- [LuaShield] seed=535693 layers=7 mode=ultra ts=1779787632
--- ShieldVM Runtime v1.0
 local _I0ooo0o0oOIoo0=4888
 local _OI0OOlIl1l1l11=bit32.bxor(23,178)
 local _O110OOO1ool=math.abs(-59)

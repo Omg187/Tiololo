@@ -1,9 +1,8 @@
-local WindUI = loadstring(game:HttpGet(
-    "https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
+local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"
 ))()
 
 local Window = WindUI:CreateWindow({
-    Title = "divulgador",
+    Title = "『ÄŁŁḤŰƁ§』",
     Icon = "zap",
     Theme = "Dark",
     Size = UDim2.fromOffset(400, 300),

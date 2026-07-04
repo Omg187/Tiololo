@@ -86,3 +86,10 @@ Tab2:Button({
         safeLoad("https://raw.githubusercontent.com/KitUserss/DarkHub/refs/heads/main/carregamento")
     end
 })
+
+Tab2:Button({
+    Title = "Hexagon Hub",
+    Callback = function()
+        safeLoad("loadstring(game:HttpGet("https://raw.githubusercontent.com/nxvap/Hexagon/main/brookhaven"))()")
+    end
+})

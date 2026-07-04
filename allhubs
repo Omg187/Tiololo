@@ -90,6 +90,6 @@ Tab2:Button({
 Tab2:Button({
     Title = "Hexagon Hub",
     Callback = function()
-        safeLoad("loadstring(game:HttpGet("https://raw.githubusercontent.com/nxvap/Hexagon/main/brookhaven"))()")
+        safeLoad("https://raw.githubusercontent.com/nxvap/Hexagon/main/brookhaven")
     end
 })

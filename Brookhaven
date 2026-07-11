@@ -1,1 +1,8 @@
 loadstring(game:HttpGet("https://raw.githubusercontent.com/tiololo487/Tiololo/refs/heads/main/Library"))()
+
+local Window = WindUI:CreateWindow({
+    Title = "|Tijolo | Hub|",
+    Icon = "moon",
+    Theme = "Dark",
+    Folder = "Tijolo"
+})

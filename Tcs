@@ -1,0 +1,920 @@
+-- ╔══════════════════════════════════════════════╗
+-- ║       TCS | SyrexGenesisX — Improved         ║
+-- ║  Fixes: debounce, var shadowing, orphan code, ║
+-- ║  part shape, duplicate handlers, loop merges  ║
+-- ╚══════════════════════════════════════════════╝
+
+local unpackValues = unpack or table.unpack
+
+local windUi = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+assert(windUi, "[TCS] WindUI failed to load")
+
+-- ── Services ─────────────────────────────────────────────────────────────────
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")   -- FIX: was overwriting shapeData[1]
+local Workspace         = game:GetService("Workspace")
+local Lighting          = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LocalPlayer       = Players.LocalPlayer
+
+-- ── State ────────────────────────────────────────────────────────────────────
+local loopTpData = {
+    ReachEnabled      = false,
+    InfReach          = false,
+    VisEnabled        = false,
+    ReachDistance     = 5,
+    BallESPEnabled    = false,
+    PowerEnabled      = false,
+    PowerMult         = 1,
+    CurveEnabled      = false,
+    CurveMult         = 1,
+    Prediction        = false,
+    LoopTP            = false,
+    AutoClaim         = false,
+    AutoClaimDist     = 15,
+    AutoCatch         = false,
+    AutoCatchDist     = 5,
+    BallControlActive = false,
+}
+
+-- FIX: proper debounce timers (tick()-0 was always > 0.8 since tick() is a Unix timestamp)
+local lastReachTick = 0
+local lastClaimTick = 0
+
+local searchableText = {}  -- list of ball BaseParts in the world
+local flag           = false
+local ScreenGui
+
+-- ── Keyword tables ───────────────────────────────────────────────────────────
+local optionData = {
+    clear = true, long = true,
+    ["driven shot"] = true, ["driven shoot"] = true,
+    shoot = true, normal = true,
+    ["normal shot"] = true, ["normal shoot"] = true,
+    ["bicycle kick"] = true, bicycle = true,
+    ["scorpion kick"] = true, scorpion = true,
+    header = true, ["backwards header"] = true,
+    ["r side shoot"] = true, ["l side shoot"] = true,
+    ["r shoot"] = true, ["l shoot"] = true,
+    rabona = true, ["high rabona"] = true, kick = true,
+}
+
+local lowerData = {
+    toolmanager = true, ["tool manager"] = true,
+    clientphysics = true, ballhandler = true,
+    main = true, shootmanager = true,
+}
+
+local powerKeywords = {
+    power = true, speed = true, force = true,
+    velocity = true, shotpower = true,
+    assemblylinearvelocity = true, impulse = true, magnitude = true,
+}
+
+local curveKeywords = {
+    curve = true, swerve = true, spin = true, curl = true,
+    rotvelocity = true, assemblyangularvelocity = true,
+    angularvelocity = true, torque = true,
+}
+
+-- ── Helpers ───────────────────────────────────────────────────────────────────
+
+-- Scale X/Z of a Vector3 (preserves Y arc of the shot)
+local function scaleHorizontal(v, n)
+    if typeof(v) == "Vector3" then
+        return Vector3.new(v.X * n, v.Y, v.Z * n)
+    end
+    return v
+end
+
+-- Scale all axes with clamp (curve / spin)
+local function scaleClamped(v, n)
+    if typeof(v) == "Vector3" then
+        return Vector3.new(
+            math.clamp(v.X * n, -150, 150),
+            math.clamp(v.Y * n, -150, 150),
+            math.clamp(v.Z * n, -150, 150)
+        )
+    end
+    return v
+end
+
+-- Returns true when the name indicates a pass / lob / cross (skip power/curve)
+local function isPassContext(k)
+    if not k or type(k) ~= "string" then return false end
+    local lower = k:lower()
+    return lower:find("pass") or lower:find("lob") or lower:find("cross")
+end
+
+-- Returns true when the name indicates a shot type
+local function isShotContext(item)
+    if not item or type(item) ~= "string" then return false end
+    local lower = item:lower()
+    if isPassContext(lower) then return false end
+    for k in pairs(optionData) do
+        if lower == k or lower:find(k, 1, true) then return true end
+    end
+    return false
+end
+
+-- Recursively apply Power/Curve multipliers to a FireServer payload table
+local function applyModifiers(data, ctx)
+    ctx = ctx or ""
+    for k, item in pairs(data) do
+        local key     = type(k) == "string" and k:lower() or ""
+        local fullCtx = key ~= "" and (ctx .. " " .. key) or ctx
+
+        if typeof(item) == "Vector3" then
+            if curveKeywords[key] and loopTpData.CurveEnabled then
+                data[k] = scaleClamped(item, loopTpData.CurveMult)
+            elseif (powerKeywords[key] or key == "") and loopTpData.PowerEnabled then
+                data[k] = scaleHorizontal(item, loopTpData.PowerMult)
+            end
+        elseif type(item) == "number" then
+            if powerKeywords[key] and loopTpData.PowerEnabled then
+                data[k] = item * loopTpData.PowerMult
+            end
+        elseif type(item) == "table" then
+            applyModifiers(item, fullCtx)   -- FIX: was re-defining handler() twice inside namecall
+        end
+    end
+end
+
+-- ── UI Window ────────────────────────────────────────────────────────────────
+local window = windUi:CreateWindow({
+    Title         = "TCS | SyrexGenesisX",
+    Size          = UDim2.fromOffset(450, 520),
+    Theme         = "Dark",
+    Resizable     = true,
+    HideSearchBar = false,
+})
+
+window:EditOpenButton({
+    Title           = "Open TCS",
+    Icon            = "monitor",
+    CornerRadius    = UDim.new(0, 8),
+    StrokeThickness = 2,
+    Draggable       = true,
+})
+
+-- Flatten all WindUI corners to square style
+task.spawn(function()
+    task.wait(1)
+    local WindUI = LocalPlayer.PlayerGui:FindFirstChild("WindUI")
+        or LocalPlayer.PlayerGui:FindFirstChild("WUI")
+    if not WindUI then return end
+    for _, item in ipairs(WindUI:GetDescendants()) do
+        if item:IsA("UICorner") then
+            item.CornerRadius = UDim.new(0, 0)
+        end
+    end
+end)
+
+local mainTab       = window:Tab({ Title = "Main" })
+local ballTab       = window:Tab({ Title = "Ball" })
+local goalkeeperTab = window:Tab({ Title = "Goalkeeper" })
+
+-- ── Main Tab ─────────────────────────────────────────────────────────────────
+mainTab:Toggle({
+    Title    = "Reach",
+    Value    = false,
+    Callback = function(v) loopTpData.ReachEnabled = v end,
+})
+mainTab:Toggle({
+    Title    = "Infinite Reach",
+    Desc     = "Hit the ball from anywhere on the map",
+    Value    = false,
+    Callback = function(v) loopTpData.InfReach = v end,
+})
+mainTab:Toggle({
+    Title    = "Reach Visualizer",
+    Value    = false,
+    Callback = function(v) loopTpData.VisEnabled = v end,
+})
+mainTab:Slider({
+    Title    = "Reach Distance",
+    Step     = 1,
+    Value    = { Min = 0, Max = 125, Default = 5 },
+    Callback = function(v) loopTpData.ReachDistance = v end,
+})
+
+-- ── Ball Tab ─────────────────────────────────────────────────────────────────
+ballTab:Toggle({
+    Title    = "Ball ESP",
+    Desc     = "Highlights the ball",
+    Value    = false,
+    Callback = function(v) loopTpData.BallESPEnabled = v end,
+})
+ballTab:Toggle({
+    Title    = "Ball Prediction Line",
+    Desc     = "Shows the predicted ball trajectory",
+    Value    = false,
+    Callback = function(v) loopTpData.Prediction = v end,
+})
+ballTab:Toggle({
+    Title    = "Loop TP to Ball",
+    Desc     = "Teleports you to the ball every frame",
+    Value    = false,
+    Callback = function(v) loopTpData.LoopTP = v end,
+})
+ballTab:Toggle({
+    Title    = "Power Shot",
+    Desc     = "Multiplies shot power",
+    Value    = false,
+    Callback = function(v) loopTpData.PowerEnabled = v end,
+})
+ballTab:Toggle({
+    Title    = "Curve Shot",
+    Desc     = "Multiplies curve / spin on the ball",
+    Value    = false,
+    Callback = function(v) loopTpData.CurveEnabled = v end,
+})
+ballTab:Slider({
+    Title    = "Power",
+    Step     = 1,
+    Value    = { Min = 1, Max = 15, Default = 1 },
+    Callback = function(v) loopTpData.PowerMult = v end,
+})
+ballTab:Slider({
+    Title    = "Curve",
+    Step     = 1,
+    Value    = { Min = 1, Max = 15, Default = 1 },
+    Callback = function(v) loopTpData.CurveMult = v end,
+})
+ballTab:Toggle({
+    Title    = "Auto Claim Ownership",
+    Desc     = "Automatically claims ball ownership",
+    Value    = false,
+    Callback = function(v) loopTpData.AutoClaim = v end,
+})
+ballTab:Slider({
+    Title    = "Auto Claim Distance",
+    Step     = 1,
+    Value    = { Min = 1, Max = 10, Default = 5 },
+    Callback = function(v) loopTpData.AutoClaimDist = v end,
+})
+
+-- ── Ball Control UI ───────────────────────────────────────────────────────────
+ballTab:Button({
+    Title    = "Ball Control UI",
+    Desc     = "Shows or hides the ball control panel",
+    Callback = function()
+        if ScreenGui then
+            ScreenGui.Enabled = not ScreenGui.Enabled
+            return
+        end
+
+        task.spawn(function()
+            -- FIX: all variables cleanly scoped — no re-declaration shadowing
+            local ballControlActive = false
+            local capturedBall      = nil
+            local capturedSpeed     = 500
+            local bodyVelocity      = nil
+            local CurrentCamera     = Workspace.CurrentCamera
+            local ChangeOwner       = ReplicatedStorage:FindFirstChild("ChangeOwner")
+
+            local function findBall()
+                for _, d in ipairs(Workspace:GetDescendants()) do
+                    if d:IsA("BasePart")
+                        and d.Name == "TPS"
+                        and d.Size == Vector3.new(2.5, 2.5, 2.5)
+                    then
+                        return d
+                    end
+                end
+            end
+
+            local function isOwner(ball)
+                if not ball then return false end
+                local ov = ball:FindFirstChild("Owner")
+                return ov and ov:IsA("ObjectValue") and ov.Value == LocalPlayer
+            end
+
+            local function claimBall(ball)
+                if not ball or not ChangeOwner then return end
+                if not isOwner(ball) then
+                    pcall(function() ChangeOwner:FireServer(ball, "Tackle") end)
+                end
+            end
+
+            local function destroyBV()
+                if bodyVelocity then bodyVelocity:Destroy() bodyVelocity = nil end
+            end
+
+            local function deactivate()
+                ballControlActive = false
+                loopTpData.BallControlActive = false
+                destroyBV()
+                local char = LocalPlayer.Character
+                if char then
+                    local h = char:FindFirstChild("Humanoid") or char
+                    CurrentCamera.CameraSubject = h
+                end
+            end
+
+            -- Build GUI
+            ScreenGui              = Instance.new("ScreenGui")
+            ScreenGui.Name         = "TPSControlGUI"
+            ScreenGui.ResetOnSpawn = false
+            ScreenGui.Parent       = LocalPlayer:WaitForChild("PlayerGui")
+
+            local Frame                 = Instance.new("Frame")
+            Frame.Size                  = UDim2.new(0, 200, 0, 170)
+            Frame.Position              = UDim2.new(0, 20, 0.5, -85)
+            Frame.BackgroundColor3      = Color3.fromRGB(20, 20, 30)
+            Frame.BorderSizePixel       = 0
+            Frame.Active                = true
+            Frame.Draggable             = true
+            Frame.Parent                = ScreenGui
+
+            -- Rounded corners for Ball Control panel
+            local UICorner              = Instance.new("UICorner")
+            UICorner.CornerRadius       = UDim.new(0, 6)
+            UICorner.Parent             = Frame
+
+            local UIStroke              = Instance.new("UIStroke")
+            UIStroke.Color              = Color3.fromRGB(100, 70, 200)
+            UIStroke.Thickness          = 1.5
+            UIStroke.Parent             = Frame
+
+            local titleLabel            = Instance.new("TextLabel")
+            titleLabel.Size             = UDim2.new(1, 0, 0, 30)
+            titleLabel.BackgroundColor3 = Color3.fromRGB(40, 30, 80)
+            titleLabel.Text             = "Ball Control"
+            titleLabel.TextColor3       = Color3.fromRGB(255, 255, 255)
+            titleLabel.TextSize         = 14
+            titleLabel.Font             = Enum.Font.GothamBold
+            titleLabel.Parent           = Frame
+
+            local controlBtn            = Instance.new("TextButton")
+            controlBtn.Size             = UDim2.new(0.9, 0, 0, 30)
+            controlBtn.Position         = UDim2.new(0.05, 0, 0.22, 0)
+            controlBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+            controlBtn.Text             = "CONTROL: OFF"
+            controlBtn.TextColor3       = Color3.fromRGB(255, 255, 255)
+            controlBtn.TextSize         = 12
+            controlBtn.Font             = Enum.Font.GothamBold
+            controlBtn.Parent           = Frame
+
+            local speedLabel                  = Instance.new("TextLabel")
+            speedLabel.Size                   = UDim2.new(0.35, 0, 0, 25)
+            speedLabel.Position               = UDim2.new(0.05, 0, 0.5, 0)
+            speedLabel.BackgroundTransparency = 1
+            speedLabel.Text                   = "SPEED:"
+            speedLabel.TextColor3             = Color3.fromRGB(255, 255, 255)
+            speedLabel.TextSize               = 11
+            speedLabel.Font                   = Enum.Font.GothamBold
+            speedLabel.TextXAlignment         = Enum.TextXAlignment.Left
+            speedLabel.Parent                 = Frame
+
+            local speedBox              = Instance.new("TextBox")
+            speedBox.Size               = UDim2.new(0.4, 0, 0, 25)
+            speedBox.Position           = UDim2.new(0.45, 0, 0.5, 0)
+            speedBox.BackgroundColor3   = Color3.fromRGB(40, 40, 50)
+            speedBox.TextColor3         = Color3.fromRGB(255, 255, 255)
+            speedBox.Text               = "500"
+            speedBox.TextSize           = 12
+            speedBox.Font               = Enum.Font.Gotham
+            speedBox.Parent             = Frame
+
+            local tpBtn                 = Instance.new("TextButton")
+            tpBtn.Size                  = UDim2.new(0.9, 0, 0, 28)
+            tpBtn.Position              = UDim2.new(0.05, 0, 0.72, 0)
+            tpBtn.BackgroundColor3      = Color3.fromRGB(70, 150, 255)
+            tpBtn.Text                  = "TELEPORT TO BALL"
+            tpBtn.TextColor3            = Color3.fromRGB(255, 255, 255)
+            tpBtn.TextSize              = 11
+            tpBtn.Font                  = Enum.Font.GothamBold
+            tpBtn.Parent                = Frame
+
+            controlBtn.MouseButton1Click:Connect(function()
+                if not ballControlActive then
+                    local ball = capturedBall or findBall()
+                    if not ball then return end
+                    capturedBall = ball
+                    claimBall(ball)
+                    destroyBV()
+                    ballControlActive            = true
+                    loopTpData.BallControlActive = true
+                    CurrentCamera.CameraSubject  = ball
+                    controlBtn.Text              = "CONTROL: ON"
+                    controlBtn.BackgroundColor3  = Color3.fromRGB(60, 200, 60)
+                else
+                    deactivate()
+                    controlBtn.Text             = "CONTROL: OFF"
+                    controlBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+                end
+            end)
+
+            tpBtn.MouseButton1Click:Connect(function()
+                local ball = capturedBall or findBall()
+                if not ball then return end
+                local char = LocalPlayer.Character
+                if not char then return end
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    hrp.CFrame = ball.CFrame + Vector3.new(0, 3, 0)
+                end
+            end)
+
+            speedBox.FocusLost:Connect(function()
+                local n = tonumber(speedBox.Text)
+                if n and n > 0 then
+                    capturedSpeed = n
+                else
+                    speedBox.Text = tostring(capturedSpeed)
+                end
+            end)
+
+            -- Drive ball every Heartbeat when active
+            RunService.Heartbeat:Connect(function()
+                if not ballControlActive then return end
+
+                -- Ball left the game or changed type
+                if not capturedBall or not capturedBall.Parent or capturedBall.Name ~= "TPS" then
+                    deactivate()
+                    controlBtn.Text             = "CONTROL: OFF"
+                    controlBtn.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+                    return
+                end
+
+                claimBall(capturedBall)
+
+                if not bodyVelocity or not bodyVelocity.Parent then
+                    bodyVelocity           = Instance.new("BodyVelocity")
+                    bodyVelocity.MaxForce  = Vector3.new(4e8, 1e7, 4e8)
+                    bodyVelocity.Velocity  = Vector3.new(0, 0, 0)
+                    bodyVelocity.Parent    = capturedBall
+                end
+
+                bodyVelocity.Velocity = CurrentCamera.CFrame.LookVector * capturedSpeed
+
+                if CurrentCamera.CameraSubject ~= capturedBall then
+                    CurrentCamera.CameraSubject = capturedBall
+                end
+            end)
+
+            -- Background: keep capturedBall reference alive
+            task.spawn(function()
+                task.wait(1)
+                if not capturedBall then
+                    capturedBall = findBall()
+                    if capturedBall then claimBall(capturedBall) end
+                end
+
+                while true do
+                    task.wait(2)
+                    if not capturedBall or not capturedBall.Parent then
+                        capturedBall = findBall()
+                        if capturedBall then claimBall(capturedBall) end
+                    elseif ballControlActive then
+                        claimBall(capturedBall)
+                    end
+                end
+            end)
+        end)
+    end,
+})
+
+-- ── Goalkeeper Tab ───────────────────────────────────────────────────────────
+goalkeeperTab:Toggle({
+    Title    = "Auto Catch",
+    Desc     = "Catches the ball when it enters your catch distance",
+    Value    = false,
+    Callback = function(v) loopTpData.AutoCatch = v end,
+})
+goalkeeperTab:Slider({
+    Title    = "Auto Catch Distance",
+    Step     = 1,
+    Value    = { Min = 0, Max = 25, Default = 5 },
+    Callback = function(v) loopTpData.AutoCatchDist = v end,
+})
+
+-- ── Ball Detection ────────────────────────────────────────────────────────────
+-- FIX: merged two separate Workspace loops into one with dedup table
+local function handleSearchableText()
+    local seen   = {}
+    local result = {}
+    for _, item in ipairs(Workspace:GetDescendants()) do
+        if not seen[item] then
+            if item:IsA("BasePart") and item.Name == "TPS" then
+                seen[item] = true
+                table.insert(result, item)
+            elseif item:IsA("Model") and item.Name == "TPS" then
+                for _, desc in ipairs(item:GetDescendants()) do
+                    if desc:IsA("BasePart") and not seen[desc] then
+                        seen[desc] = true
+                        table.insert(result, desc)
+                    end
+                end
+            end
+        end
+    end
+    return result
+end
+
+-- ── Trajectory Prediction ─────────────────────────────────────────────────────
+local trajectoryFolder      = Instance.new("Folder")
+trajectoryFolder.Name       = "TrajectoryLine"
+trajectoryFolder.Parent     = Workspace
+
+-- FIX: removed shapeData[3]/shapeData[4] temp-variable abuse; using clean locals
+local trajectoryParts = {}
+for i = 1, 150 do
+    local p        = Instance.new("Part")
+    p.Anchored     = true
+    p.CanCollide   = false
+    p.Material     = Enum.Material.Neon
+    p.Shape        = Enum.PartType.Cylinder
+    p.CastShadow   = false
+    p.Transparency = 1
+    p.Parent       = trajectoryFolder
+    trajectoryParts[i] = p
+end
+
+RunService.RenderStepped:Connect(function()
+    if not loopTpData.Prediction then
+        for _, p in ipairs(trajectoryParts) do p.Transparency = 1 end
+        return
+    end
+
+    local char      = LocalPlayer.Character
+    local hrp       = char and char:FindFirstChild("HumanoidRootPart")
+    local originPos = hrp and hrp.Position or Vector3.new()
+
+    -- Find closest ball to the player
+    local closestBall, closestDist = nil, math.huge
+    for _, ball in ipairs(searchableText) do
+        if ball and ball.Parent then
+            local d = (ball.Position - originPos).Magnitude
+            if d < closestDist then
+                closestDist = d
+                closestBall = ball
+            end
+        end
+    end
+
+    if not closestBall or closestBall.AssemblyLinearVelocity.Magnitude < 2 then
+        for _, p in ipairs(trajectoryParts) do p.Transparency = 1 end
+        return
+    end
+
+    local pos       = closestBall.Position
+    local vel       = closestBall.AssemblyLinearVelocity
+    local gravity   = Vector3.new(0, -Workspace.Gravity, 0)
+    local dt        = 0.05
+    local hue0      = tick() * 0.8
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = { char, trajectoryFolder, closestBall }
+
+    for i = 1, 150 do
+        local nextPos = pos + vel * dt + 0.5 * gravity * dt * dt
+        local hit     = Workspace:Raycast(pos, nextPos - pos, rayParams)
+        local endPos  = hit and hit.Position or nextPos
+        local segLen  = (endPos - pos).Magnitude
+        local seg     = trajectoryParts[i]
+
+        seg.Size         = Vector3.new(segLen, 0.45, 0.45)
+        seg.CFrame       = CFrame.lookAt(pos, endPos)
+            * CFrame.new(0, 0, -segLen / 2)
+            * CFrame.Angles(0, math.pi / 2, 0)
+        seg.Transparency = math.min(0.1 + i / 150, 0.8)
+        seg.Color        = Color3.fromHSV((hue0 + i / 20) % 1, 1, 1)
+
+        if hit then
+            for j = i + 1, 150 do trajectoryParts[j].Transparency = 1 end
+            break
+        end
+
+        vel = vel + gravity * dt
+        pos = nextPos
+    end
+end)
+
+-- ── Reach Visualizer Part ─────────────────────────────────────────────────────
+-- FIX: shape changed from Block to Ball (sphere makes sense for a reach indicator)
+local reachPart           = Instance.new("Part")
+reachPart.Name            = "ReachVisualizer"
+reachPart.Anchored        = true
+reachPart.CanCollide      = false
+reachPart.Massless        = true
+reachPart.CastShadow      = false
+reachPart.Material        = Enum.Material.ForceField
+reachPart.Shape           = Enum.PartType.Ball
+reachPart.Color           = Color3.fromRGB(255, 50, 50)
+reachPart.Transparency    = 0.4
+reachPart.Parent          = nil
+
+-- ── Background Loop: ESP + Cooldown Removal ───────────────────────────────────
+task.spawn(function()
+    while task.wait(0.5) do
+        searchableText = handleSearchableText()
+
+        local reachOn = loopTpData.ReachEnabled or loopTpData.InfReach
+
+        for _, ball in ipairs(searchableText) do
+            -- Ball ESP
+            local adorn = ball:FindFirstChild("TPS_ESP_Adornment")
+            if loopTpData.BallESPEnabled then
+                if not adorn then
+                    local sph          = Instance.new("SphereHandleAdornment")
+                    sph.Name           = "TPS_ESP_Adornment"
+                    sph.Adornee        = ball
+                    sph.Radius         = ball.Size.X / 2 + 0.1
+                    sph.Color3         = Color3.fromRGB(255, 50, 50)
+                    sph.Transparency   = 0.5
+                    sph.AlwaysOnTop    = true
+                    sph.ZIndex         = 10
+                    sph.Parent         = ball
+                end
+            elseif adorn then
+                adorn:Destroy()
+            end
+
+            -- Remove anti-dribble flags when reach is active
+            if reachOn and ball.Parent then
+                local rd = ball:FindFirstChild("ReactDecline")
+                local dd = ball:FindFirstChild("DribbleDecline")
+                if rd then rd:Destroy() end
+                if dd then dd:Destroy() end
+            end
+        end
+
+        -- Remove ownership cooldown instance
+        if reachOn then
+            pcall(function()
+                local cd = Lighting:FindFirstChild("ChangeOwnerCooldown")
+                if cd then cd:Destroy() end
+            end)
+        end
+    end
+end)
+
+-- ── Heartbeat: Reach / LoopTP / AutoClaim / AutoCatch ────────────────────────
+RunService.Heartbeat:Connect(function()
+    local Character = LocalPlayer.Character
+    if not Character then
+        reachPart.Parent = nil
+        flag = false
+        return
+    end
+
+    local HRP      = Character:FindFirstChild("HumanoidRootPart")
+    local Humanoid = Character:FindFirstChildOfClass("Humanoid")
+
+    -- Reach Visualizer
+    if loopTpData.VisEnabled and HRP then
+        local d          = loopTpData.ReachDistance * 2
+        reachPart.Size   = Vector3.new(d, d, d)
+        reachPart.CFrame = HRP.CFrame
+        if reachPart.Parent ~= Workspace.CurrentCamera then
+            reachPart.Parent = Workspace.CurrentCamera
+        end
+    else
+        reachPart.Parent = nil
+    end
+
+    -- Loop TP to ball
+    if loopTpData.LoopTP and HRP and #searchableText > 0 then
+        local ball = searchableText[1]
+        if ball and ball.Parent then
+            local lookVec = Workspace.CurrentCamera.CFrame.LookVector
+            local unit    = Vector3.new(lookVec.X, 0, lookVec.Z).Unit
+            local dest    = ball.Position + Vector3.new(0, 1.2, 0)
+            HRP.CFrame    = CFrame.lookAt(dest, dest + unit)
+            HRP.AssemblyLinearVelocity = ball.AssemblyLinearVelocity
+            if Humanoid then Humanoid.PlatformStand = false end
+        end
+    end
+
+    if #searchableText == 0 or not HRP then return end
+
+    local ball = searchableText[1]
+    if not ball or not ball:IsA("BasePart") then return end
+
+    local dist = (HRP.Position - ball.Position).Magnitude
+    local now  = tick()
+
+    -- Reach / firetouchinterest
+    local reachOn = loopTpData.ReachEnabled or loopTpData.InfReach
+    if reachOn and now - lastReachTick > 0.1 then   -- FIX: proper debounce
+        lastReachTick = now
+        local inRange = loopTpData.InfReach or dist <= loopTpData.ReachDistance
+        if inRange then
+            for _, limbName in ipairs({
+                "Right Leg","Left Leg","Head","Torso",
+                "UpperTorso","LowerTorso",
+                "RightFoot","LeftFoot",
+                "RightLowerLeg","LeftLowerLeg",
+                "RightUpperLeg","LeftUpperLeg",
+                "RightHand","LeftHand",
+            }) do
+                local limb = Character:FindFirstChild(limbName)
+                if limb then
+                    pcall(function()
+                        firetouchinterest(ball, limb, 0)
+                        firetouchinterest(ball, limb, 1)
+                    end)
+                end
+            end
+        end
+    end
+
+    -- Auto Claim
+    if loopTpData.AutoClaim
+        and dist <= loopTpData.AutoClaimDist
+        and now - lastClaimTick > 0.1              -- FIX: proper debounce
+    then
+        lastClaimTick = now
+        pcall(function()
+            ReplicatedStorage.ChangeOwner:FireServer(ball, nil)
+            ReplicatedStorage.ChangeValue:FireServer(ball)
+        end)
+    end
+
+    -- Auto Catch
+    if loopTpData.AutoCatch and dist <= loopTpData.AutoCatchDist and not flag then
+        pcall(function()
+            ReplicatedStorage.CatchBall:FireServer(ball)
+        end)
+    end
+end)
+
+-- ── Metatable Hooks ───────────────────────────────────────────────────────────
+local mt           = getrawmetatable(game)
+local mt_index     = mt.__index
+local mt_newindex  = mt.__newindex
+local mt_namecall  = mt.__namecall
+
+setreadonly(mt, false)
+
+-- __index — fake ball Position/CFrame to player foot for Reach
+mt.__index = newcclosure(function(obj, key)
+    if not checkcaller() then
+        local keyStr = tostring(key)
+        if keyStr == "Position" or keyStr == "CFrame" then
+            local reachOn = loopTpData.ReachEnabled or loopTpData.InfReach
+            if reachOn then
+                local cam        = Workspace.CurrentCamera
+                local camSubject = cam and cam.CameraSubject
+                local camOnBall  = camSubject
+                    and camSubject:IsA("BasePart")
+                    and camSubject.Name == "TPS"
+
+                if not loopTpData.BallControlActive and not camOnBall then
+                    local isBall = obj.Name == "TPS" or table.find(searchableText, obj)
+                    if isBall then
+                        local char = LocalPlayer.Character
+                        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+                        if hrp then
+                            local fakePos = hrp.Position
+                                + hrp.CFrame.LookVector * 1.2
+                                - Vector3.new(0, 1, 0)
+                            if keyStr == "Position" then
+                                return fakePos
+                            else
+                                local realCF = mt_index(obj, "CFrame")
+                                return CFrame.new(fakePos) * (realCF - realCF.Position)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return mt_index(obj, key)
+end)
+
+-- __newindex — intercept ball velocity writes for Power/Curve
+mt.__newindex = newcclosure(function(obj, key, value)
+    if typeof(value) == "Vector3" then
+        local char = LocalPlayer.Character
+        -- Never intercept character-owned parts
+        if char and typeof(obj) == "Instance" and obj:IsDescendantOf(char) then
+            return mt_newindex(obj, key, value)
+        end
+
+        local script     = getcallingscript and getcallingscript()
+        local scriptName = script and script.Name:lower() or ""
+        local parentName = script and script.Parent and script.Parent.Name:lower() or ""
+
+        if isPassContext(scriptName) or isPassContext(parentName) then
+            return mt_newindex(obj, key, value)
+        end
+
+        local isShot = isShotContext(scriptName) or lowerData[scriptName]
+            or isShotContext(parentName) or lowerData[parentName]
+
+        if isShot then
+            local kl = key:lower()
+            if loopTpData.PowerEnabled then
+                if kl == "velocity" or kl == "assemblylinearvelocity" or kl == "vectorvelocity" then
+                    value = scaleHorizontal(value, loopTpData.PowerMult)
+                end
+            end
+            if loopTpData.CurveEnabled then
+                if kl == "assemblyangularvelocity" or kl == "rotvelocity" then
+                    value = scaleClamped(value, loopTpData.CurveMult)
+                elseif kl == "angularvelocity" and obj:IsA("AngularVelocity") then
+                    value = scaleClamped(value, loopTpData.CurveMult)
+                elseif kl == "force" and (obj:IsA("BodyForce") or obj:IsA("VectorForce")) then
+                    value = value * loopTpData.CurveMult
+                elseif kl == "thrust" and obj:IsA("BodyThrust") then
+                    value = value * loopTpData.CurveMult
+                elseif kl == "torque" and obj:IsA("Torque") then
+                    value = scaleClamped(value, loopTpData.CurveMult)
+                end
+            end
+        end
+    end
+    return mt_newindex(obj, key, value)
+end)
+
+-- __namecall — intercept ApplyImpulse, ApplyAngularImpulse, FireServer
+mt.__namecall = newcclosure(function(obj, ...)
+    local args   = { ... }
+    local method = getnamecallmethod()
+    local script = getcallingscript and getcallingscript()
+    local sName  = script and script.Name:lower() or ""
+    local pName  = script and script.Parent and script.Parent.Name:lower() or ""
+
+    -- ApplyImpulse → Power multiplier
+    if method == "ApplyImpulse" and loopTpData.PowerEnabled then
+        if not isPassContext(sName) then
+            local isShot = isShotContext(sName) or lowerData[sName]
+                or isShotContext(pName) or lowerData[pName]
+            if isShot and typeof(args[1]) == "Vector3" then
+                args[1] = scaleHorizontal(args[1], loopTpData.PowerMult)
+            end
+        end
+        return mt_namecall(obj, unpackValues(args))
+    end
+
+    -- ApplyAngularImpulse → Curve multiplier
+    if method == "ApplyAngularImpulse" and loopTpData.CurveEnabled then
+        if not isPassContext(sName) then
+            local isShot = isShotContext(sName) or lowerData[sName]
+                or isShotContext(pName) or lowerData[pName]
+            if isShot and typeof(args[1]) == "Vector3" then
+                args[1] = scaleClamped(args[1], loopTpData.CurveMult)
+            end
+        end
+        return mt_namecall(obj, unpackValues(args))
+    end
+
+    -- FireServer on RemoteEvent → applyModifiers to payload
+    if method == "FireServer" and obj.ClassName == "RemoteEvent" then
+        if isPassContext(sName) or isPassContext(obj.Name) then
+            return mt_namecall(obj, unpackValues(args))
+        end
+
+        local isShot  = isShotContext(sName) or isShotContext(obj.Name)
+        local isKnown = not isShot and (lowerData[sName] or lowerData[obj.Name:lower()])
+
+        -- FIX: factored duplicate inner handler() into single applyModifiers()
+        -- Deep-scan args when script name alone is inconclusive
+        if not isShot and not isKnown then
+            local function scanForShot(t)
+                for k, v in pairs(t) do
+                    local ks = type(k) == "string" and k or ""
+                    local vs = type(v) == "string" and v or ""
+                    if isPassContext(ks) or isPassContext(vs) then return false end
+                    if isShotContext(ks) or isShotContext(vs) then return true end
+                    if type(v) == "table" then
+                        local found = scanForShot(v)
+                        if found ~= nil then return found end
+                    end
+                end
+            end
+            local r = scanForShot(args)
+            if r == false then return mt_namecall(obj, unpackValues(args)) end
+            isShot = r or false
+        end
+
+        if isShot or isKnown then
+            for i, item in ipairs(args) do
+                if type(item) == "table" then
+                    applyModifiers(item, obj.Name)
+                elseif typeof(item) == "Vector3"
+                    and loopTpData.PowerEnabled
+                    and item.Magnitude < 3000
+                then
+                    args[i] = scaleHorizontal(item, loopTpData.PowerMult)
+                elseif type(item) == "number"
+                    and loopTpData.PowerEnabled
+                    and item > 10 and item < 1000
+                then
+                    args[i] = item * loopTpData.PowerMult
+                end
+            end
+        end
+    end
+
+    return mt_namecall(obj, unpackValues(args))
+end)
+
+setreadonly(mt, true)
+-- ── End ───────────────────────────────────────────────────────────────────────
+

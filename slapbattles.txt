@@ -1,0 +1,1070 @@
+-- Slap Farm Hub — Improved Build
+-- Fixes: math.random float bug, 20k hard cap removed (now 10M),
+--        farm loop crash (added task.wait + batch firing),
+--        deprecated wait() → task.wait(), undefined CreateGui/RestoreGuiState,
+--        initial loop blocking new players (Slaps==0), progress counter,
+--        Color3 discarded calls, faster farm throughput.
+
+local Hint = Instance.new("Hint")
+Hint.Text = "Script is loading please wait"
+Hint.Parent = game:GetService("CoreGui")
+
+datatable = slapfarmdatatable or {}
+datatable.serverhop              = datatable.serverhop              or false
+datatable.slaps                  = datatable.slaps                  or 1000
+datatable.slap_gain_ended_trigger = datatable.slap_gain_ended_trigger or 5
+datatable.no_gui_during_farm     = datatable.no_gui_during_farm     or false
+
+-- Executor compat stubs
+getgenv().hookmetamethod    = getgenv().hookmetamethod    or function(...) return ... end
+getgenv().getnamecallmethod = getgenv().getnamecallmethod or function(...) return ... end
+getgenv().hookfunction      = getgenv().hookfunction      or function(...) return ... end
+getgenv().newcclosure       = getgenv().newcclosure       or function(...) return ... end
+getgenv().HelloThere        = function(_)
+    return "I decided to not implement function that rejoins and blocks those functions on join because I figured out that would be annoying."
+end
+
+-- ── Wait for game to be ready ─────────────────────────────────────────────────
+-- Fix: original condition blocked players with 0 slaps (new accounts)
+repeat
+    task.wait()
+until game:GetService("Players")
+    and game:GetService("Players").LocalPlayer
+    and game:GetService("Players").LocalPlayer:FindFirstChild("leaderstats")
+    and game:GetService("Players").LocalPlayer.leaderstats:FindFirstChild("Slaps")
+    and game:GetService("Players").LocalPlayer.leaderstats.Slaps.Value ~= 999999999
+    -- Fix: removed ~= 0 check that permanently blocked new players
+
+local LocalPlayer = game.Players.LocalPlayer
+task.wait(1)
+
+if not slapfarmalrexec then
+    if game.PlaceId ~= 9015014224 then
+        -- Fix: threshold lowered to 11750 but kept as-is per original intent
+        if LocalPlayer.leaderstats.Slaps.Value >= 11750 then
+            if LocalPlayer._unlockedGloves.Counter.Value == true then
+                if not LocalPlayer.Character or not LocalPlayer.Character:FindFirstChild("entered") then
+
+                    -- Remove KillstreakUI
+                    pcall(function()
+                        for _, item in next, LocalPlayer.PlayerGui:GetChildren() do
+                            if item.Name == "KillstreakUI" then item:Destroy() end
+                        end
+                        LocalPlayer.PlayerGui.ChildAdded:Connect(function(child)
+                            if child.Name == "KillstreakUI" then child:Destroy() end
+                        end)
+                    end)
+
+                    getgenv().slapfarmalrexec = true
+
+                    -- Patch FlagService
+                    pcall(function()
+                        local FlagService = require(
+                            game:GetService("ReplicatedStorage").BACKEND.Shared.Flags.FlagService
+                        )
+                        local IsEnabled = FlagService.IsEnabled
+                        function FlagService.IsEnabled(argument, ...)
+                            if argument == "IgnoreSafety" then return true end
+                            return IsEnabled(argument, ...)
+                        end
+                    end)
+
+                    -- Disable purchase prompts
+                    pcall(function()
+                        game.CoreGui.PurchasePromptApp.Enabled = false
+                        if not game:GetService("CoreGui"):FindFirstChild("FoundationOverlay") then
+                            local conn
+                            conn = game:GetService("CoreGui").ChildAdded:Connect(function(child)
+                                if child.Name == "FoundationOverlay" then
+                                    child.Enabled = false
+                                    conn:Disconnect()
+                                end
+                            end)
+                            return
+                        end
+                        game:GetService("CoreGui").FoundationOverlay.Enabled = false
+                    end)
+
+                    task.wait(7)
+
+                    -- ── Remote obfuscation system ─────────────────────────────────────────
+                    local data    = {}
+                    local remotes = {}
+
+                    local function scrubRemote(remote)
+                        for k, _ in next, remote:GetAttributes() do
+                            remote:SetAttribute(k, nil)
+                        end
+                        remote:ClearAllChildren()
+                    end
+
+                    -- Enumerate and rename existing remotes
+                    for _, descendant in ipairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+                        if (descendant:IsA("RemoteFunction") or descendant:IsA("RemoteEvent"))
+                            and not data[descendant]
+                        then
+                            scrubRemote(descendant)
+                            local guid = game:GetService("HttpService"):GenerateGUID(true)
+                            data[descendant] = {
+                                OriginalName = descendant.Name,
+                                Remote       = descendant,
+                                CurrentGUID  = guid,
+                            }
+                            descendant.Name = guid
+
+                            local captured = descendant
+                            local conn = descendant:GetPropertyChangedSignal("Name"):Connect(function()
+                                if data[captured] and captured.Name ~= data[captured].CurrentGUID then
+                                    pcall(function() captured.Name = data[captured].CurrentGUID end)
+                                end
+                            end)
+                            data[descendant].ProtectionConnection = conn
+                            table.insert(remotes, descendant)
+                        end
+                    end
+
+                    -- Watch for new remotes
+                    game:GetService("ReplicatedStorage").DescendantAdded:Connect(function(remote)
+                        if (remote:IsA("RemoteFunction") or remote:IsA("RemoteEvent"))
+                            and not data[remote]
+                        then
+                            scrubRemote(remote)
+                            local guid = game:GetService("HttpService"):GenerateGUID(true)
+                            data[remote] = {
+                                OriginalName = remote.Name,
+                                Remote       = remote,
+                                CurrentGUID  = guid,
+                            }
+                            remote.Name = guid
+
+                            local captured = remote
+                            local conn = remote:GetPropertyChangedSignal("Name"):Connect(function()
+                                if data[captured] and captured.Name ~= data[captured].CurrentGUID then
+                                    pcall(function() captured.Name = data[captured].CurrentGUID end)
+                                end
+                            end)
+                            data[remote].ProtectionConnection = conn
+                            table.insert(remotes, remote)
+                        end
+                    end)
+
+                    -- Remove remotes that leave
+                    game:GetService("ReplicatedStorage").DescendantRemoving:Connect(function(remote)
+                        if data[remote] then
+                            if data[remote].ProtectionConnection then
+                                data[remote].ProtectionConnection:Disconnect()
+                            end
+                            data[remote] = nil
+                            for i, item in ipairs(remotes) do
+                                if item == remote then
+                                    table.remove(remotes, i)
+                                    break
+                                end
+                            end
+                        end
+                    end)
+
+                    -- Periodic GUID rotation
+                    -- Fix: math.random(0.1, 2) is broken in Lua (ints only) → use division
+                    task.spawn(function()
+                        while true do
+                            local waitTime = math.random(1, 20) / 10  -- 0.1 to 2.0 seconds
+                            task.wait(waitTime)
+                            if #remotes > 0 then
+                                local remote = remotes[math.random(1, #remotes)]
+                                if remote and data[remote] then
+                                    scrubRemote(remote)
+                                    local guid = game:GetService("HttpService"):GenerateGUID(true)
+                                    data[remote].CurrentGUID = guid
+                                    pcall(function() remote.Name = guid end)
+                                end
+                            end
+                        end
+                    end)
+
+                    -- ── State ─────────────────────────────────────────────────────────────
+                    local sendK                    = nil
+                    local screenGui                = nil
+                    local frame                    = nil
+                    local valueLabel               = nil
+                    local secondaryParent          = nil
+                    local textBox                  = nil
+                    local startButton              = nil
+                    local textLabel                = nil
+                    local progressLabel            = nil  -- NEW: real-time progress
+                    -- Fix: cap raised from 20k to 10,000,000
+                    local MAX_SLAPS                = 10000000
+                    local slaps                    = datatable.slaps
+                    local updateInstancePropertiesData = {}
+                    local Sound                    = nil
+                    local soundConnection          = nil
+                    local visible                  = false
+                    local text                     = "idle"
+                    local updateInstancePropertiesFlag = false
+
+                    -- Colors (fix: removed discarded Color3.fromRGB calls)
+                    local backgroundColor3          = Color3.fromRGB(30,  50,  30)
+                    local secondaryBackgroundColor   = Color3.fromRGB(40,  65,  40)
+                    local alternateBackgroundColor   = Color3.fromRGB(50,  80,  50)
+                    local additionalBackgroundColor  = Color3.fromRGB(60,  100, 60)
+                    local textColor3                 = Color3.fromRGB(180, 255, 180)
+                    local secondaryTextColor         = Color3.fromRGB(140, 200, 140)
+
+                    local capturedText
+                    local no_gui_during_farm = datatable.no_gui_during_farm
+
+                    -- Disable 3D rendering during processing (perf boost)
+                    task.spawn(function()
+                        game:GetService("RunService").Heartbeat:Connect(function()
+                            game:GetService("RunService"):Set3dRenderingEnabled(text ~= "processing")
+                        end)
+                    end)
+
+                    -- ── Sound management ──────────────────────────────────────────────────
+                    local function muteAllSounds()
+                        for _, descendant in ipairs(workspace:GetDescendants()) do
+                            if descendant:IsA("Sound") and not updateInstancePropertiesData[descendant] then
+                                updateInstancePropertiesData[descendant] = {
+                                    descendant.Volume,
+                                    descendant.IsPlaying,
+                                    descendant.TimePosition,
+                                }
+                                descendant.Volume  = 0
+                                descendant.Playing = false
+                            end
+                        end
+                    end
+
+                    local function restoreAllSounds()
+                        if soundConnection then soundConnection:Disconnect(); soundConnection = nil end
+                        for k, v in pairs(updateInstancePropertiesData) do
+                            pcall(function()
+                                k.Volume = v[1]
+                                if v[2] then
+                                    k.TimePosition = v[3]
+                                    k.Playing = true
+                                end
+                            end)
+                        end
+                        updateInstancePropertiesData = {}
+                    end
+
+                    -- ── GUI persistence guard ─────────────────────────────────────────────
+                    local secondaryConnection, alternateConnection, additionalConnection
+                    local fallbackConnection, nestedConnection
+
+                    local function attachGuiGuards()
+                        if not screenGui then return end
+
+                        if secondaryConnection then secondaryConnection:Disconnect() end
+                        if alternateConnection  then alternateConnection:Disconnect()  end
+                        if additionalConnection then additionalConnection:Disconnect() end
+                        if fallbackConnection   then fallbackConnection:Disconnect()   end
+                        if nestedConnection     then nestedConnection:Disconnect()     end
+
+                        secondaryConnection = screenGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+                            if updateInstancePropertiesFlag and not screenGui.Enabled then
+                                screenGui.Enabled = true
+                            end
+                        end)
+                        alternateConnection = screenGui:GetPropertyChangedSignal("Parent"):Connect(function()
+                            if updateInstancePropertiesFlag and screenGui.Parent ~= game:GetService("CoreGui") then
+                                screenGui.Parent = game:GetService("CoreGui")
+                            end
+                        end)
+                        additionalConnection = screenGui:GetPropertyChangedSignal("Name"):Connect(function()
+                            if updateInstancePropertiesFlag and screenGui.Name ~= "FullScreenCover" then
+                                screenGui.Name = "FullScreenCover"
+                            end
+                        end)
+
+                        -- Fix: AncestryChanged previously called undefined CreateGui/RestoreGuiState
+                        fallbackConnection = screenGui.AncestryChanged:Connect(function(_, parent)
+                            if updateInstancePropertiesFlag and not parent then
+                                -- Recreate the GUI inline instead of calling undefined functions
+                                screenGui   = nil
+                                frame       = nil
+                                valueLabel  = nil
+                                secondaryParent = nil
+                                textBox     = nil
+                                startButton = nil
+                                textLabel   = nil
+                                progressLabel = nil
+                                createFullScreenCover()
+                                if visible then Show() end
+                            end
+                        end)
+
+                        nestedConnection = game:GetService("RunService").Heartbeat:Connect(function()
+                            if updateInstancePropertiesFlag and screenGui and screenGui.Parent then
+                                if not screenGui.Enabled            then screenGui.Enabled = true end
+                                if screenGui.Parent ~= game:GetService("CoreGui") then
+                                    screenGui.Parent = game:GetService("CoreGui")
+                                end
+                                if screenGui.Name ~= "FullScreenCover" then
+                                    screenGui.Name = "FullScreenCover"
+                                end
+                                if frame then
+                                    if frame.BackgroundTransparency ~= 0 then
+                                        frame.BackgroundTransparency = 0
+                                        frame.BackgroundColor3       = backgroundColor3
+                                    end
+                                    if secondaryParent and secondaryParent.BackgroundTransparency ~= 0 then
+                                        secondaryParent.BackgroundTransparency = 0
+                                        secondaryParent.BackgroundColor3       = secondaryBackgroundColor
+                                    end
+                                    if startButton and startButton.BackgroundTransparency ~= 0 then
+                                        startButton.BackgroundTransparency = 0
+                                        startButton.BackgroundColor3       = alternateBackgroundColor
+                                    end
+                                    if textLabel  and textLabel.TextTransparency  ~= 0 then textLabel.TextTransparency  = 0 end
+                                    if valueLabel and valueLabel.TextTransparency ~= 0 then valueLabel.TextTransparency = 0 end
+                                end
+                            end
+                        end)
+                    end
+
+                    -- ── GUI builder ───────────────────────────────────────────────────────
+                    function createFullScreenCover()
+                        if screenGui and screenGui.Parent then return end
+                        if screenGui then screenGui = nil end
+
+                        screenGui = Instance.new("ScreenGui")
+                        screenGui.Name            = "FullScreenCover"
+                        screenGui.ResetOnSpawn    = false
+                        screenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+                        screenGui.DisplayOrder    = 10
+                        screenGui.IgnoreGuiInset  = true
+
+                        frame = Instance.new("Frame")
+                        frame.Name                = "Cover"
+                        frame.Size                = UDim2.new(1, 0, 1, 0)
+                        frame.BackgroundColor3    = backgroundColor3
+                        frame.BackgroundTransparency = 0
+                        frame.BorderSizePixel     = 0
+                        frame.ZIndex              = 10
+                        frame.Active              = true
+                        frame.Visible             = false
+
+                        -- CoreGui offset fix
+                        local coreFix = Instance.new("Frame")
+                        coreFix.Name                  = "CoreFix"
+                        coreFix.Size                  = UDim2.new(1, 0, 1, 0)
+                        coreFix.Position              = UDim2.new(0, 0, 0, -36)
+                        coreFix.BackgroundColor3      = backgroundColor3
+                        coreFix.BackgroundTransparency = 0
+                        coreFix.BorderSizePixel       = 0
+                        coreFix.ZIndex                = 10
+                        coreFix.Parent                = frame
+
+                        -- Title
+                        textLabel = Instance.new("TextLabel")
+                        textLabel.Name               = "TitleLabel"
+                        textLabel.Size               = UDim2.new(1, 0, 0, 60)
+                        textLabel.Position           = UDim2.new(0, 0, 0.35, -30)
+                        textLabel.BackgroundTransparency = 1
+                        textLabel.Text               = "◆ cool slap farm by nexer ( netzach edition ) ◆"
+                        textLabel.TextColor3         = textColor3
+                        textLabel.TextScaled         = true
+                        textLabel.Font               = Enum.Font.GothamBold
+                        textLabel.ZIndex             = 11
+                        textLabel.Parent             = frame
+
+                        -- Status label
+                        valueLabel = Instance.new("TextLabel")
+                        valueLabel.Name              = "SubLabel"
+                        valueLabel.Size              = UDim2.new(1, 0, 0, 40)
+                        valueLabel.Position          = UDim2.new(0, 0, 0.41, 20)
+                        valueLabel.BackgroundTransparency = 1
+                        valueLabel.Text              = "enter slaps amount below"
+                        valueLabel.TextColor3        = secondaryTextColor
+                        valueLabel.TextScaled        = true
+                        valueLabel.Font              = Enum.Font.Gotham
+                        valueLabel.ZIndex            = 11
+                        valueLabel.Parent            = frame
+
+                        -- NEW: real-time progress label
+                        progressLabel = Instance.new("TextLabel")
+                        progressLabel.Name              = "ProgressLabel"
+                        progressLabel.Size              = UDim2.new(1, 0, 0, 28)
+                        progressLabel.Position          = UDim2.new(0, 0, 0.46, 20)
+                        progressLabel.BackgroundTransparency = 1
+                        progressLabel.Text              = ""
+                        progressLabel.TextColor3        = Color3.fromRGB(100, 220, 100)
+                        progressLabel.TextScaled        = true
+                        progressLabel.Font              = Enum.Font.Gotham
+                        progressLabel.ZIndex            = 11
+                        progressLabel.Parent            = frame
+
+                        -- Input frame
+                        secondaryParent = Instance.new("Frame")
+                        secondaryParent.Name              = "InputFrame"
+                        secondaryParent.Size              = UDim2.new(0, 280, 0, 44)
+                        secondaryParent.Position          = UDim2.new(0.5, -140, 0.52, 10)
+                        secondaryParent.BackgroundColor3  = secondaryBackgroundColor
+                        secondaryParent.BackgroundTransparency = 0
+                        secondaryParent.BorderSizePixel   = 0
+                        secondaryParent.ZIndex            = 11
+                        secondaryParent.Parent            = frame
+
+                        textBox = Instance.new("TextBox")
+                        textBox.Name               = "TextBox"
+                        textBox.Size               = UDim2.new(1, -20, 1, 0)
+                        textBox.Position           = UDim2.new(0, 10, 0, 0)
+                        textBox.BackgroundTransparency = 1
+                        textBox.PlaceholderText    = "enter slap amount (max 10,000,000)"
+                        textBox.PlaceholderColor3  = Color3.fromRGB(100, 150, 100)
+                        textBox.Text               = tostring(datatable.slaps)
+                        textBox.TextColor3         = textColor3
+                        textBox.TextScaled         = true
+                        textBox.Font               = Enum.Font.GothamBold
+                        textBox.ZIndex             = 12
+                        textBox.ClearTextOnFocus   = false
+                        textBox.Parent             = secondaryParent
+
+                        startButton = Instance.new("TextButton")
+                        startButton.Name              = "ConfirmButton"
+                        startButton.Size              = UDim2.new(0, 200, 0, 38)
+                        startButton.Position          = UDim2.new(0.5, -100, 0.58, 10)
+                        startButton.BackgroundColor3  = alternateBackgroundColor
+                        startButton.BackgroundTransparency = 0
+                        startButton.BorderSizePixel   = 0
+                        startButton.Text              = "start"
+                        startButton.TextColor3        = textColor3
+                        startButton.TextScaled        = true
+                        startButton.Font              = Enum.Font.GothamBold
+                        startButton.ZIndex            = 11
+                        startButton.MouseEnter:Connect(function()
+                            startButton.BackgroundColor3 = additionalBackgroundColor
+                        end)
+                        startButton.MouseLeave:Connect(function()
+                            startButton.BackgroundColor3 = alternateBackgroundColor
+                        end)
+                        startButton.Parent = frame
+
+                        frame.Parent    = screenGui
+                        screenGui.Parent = game:GetService("CoreGui")
+                        attachGuiGuards()
+                        updateInstancePropertiesFlag = true
+                    end
+
+                    function Show()
+                        createFullScreenCover()
+                        frame.Visible                = true
+                        frame.BackgroundTransparency = 0
+                        frame.BackgroundColor3       = backgroundColor3
+                        if secondaryParent then
+                            secondaryParent.BackgroundTransparency = 0
+                            secondaryParent.BackgroundColor3       = secondaryBackgroundColor
+                        end
+                        visible = true
+                        if valueLabel then capturedText = valueLabel.Text end
+                        if textBox    then local s = textBox.Text end
+                    end
+
+                    function Hide()
+                        if frame then
+                            frame.Visible = false
+                            visible = false
+                            if valueLabel then capturedText = valueLabel.Text end
+                        end
+                    end
+
+                    function updatetext(msg)
+                        if valueLabel then
+                            valueLabel.Text = msg
+                            capturedText    = msg
+                        end
+                    end
+
+                    function updateprogress(msg)
+                        if progressLabel then
+                            progressLabel.Text = msg
+                        end
+                    end
+
+                    -- ── Velocity zeroing helper ───────────────────────────────────────────
+                    local function zeroVelocity(character)
+                        for _, item in next, character:GetDescendants() do
+                            if item and item:IsA("BasePart") then
+                                item.Velocity    = Vector3.new(0, 0, 0)
+                                item.RotVelocity = Vector3.new(0, 0, 0)
+                            end
+                        end
+                    end
+
+                    -- ── Teleport pad bypass ───────────────────────────────────────────────
+                    local function updateCanCollide(character, hrp)
+                        local cFrame = workspace.Lobby.Teleport1.CFrame
+                        workspace.Lobby.Teleport1.CanCollide = false
+                        task.wait()
+                        repeat
+                            task.wait()
+                            pcall(function()
+                                workspace.Lobby.Teleport1:PivotTo(hrp.CFrame)
+                            end)
+                        until character and character:FindFirstChild("entered")
+                        workspace.Lobby.Teleport1:PivotTo(cFrame)
+                        workspace.Lobby.Teleport1.CanCollide = true
+                    end
+
+                    -- ── Equip glove helper ────────────────────────────────────────────────
+                    local function EquipGlove(name)
+                        for k, item in pairs(data) do
+                            if item.OriginalName == "SelectGlove [STUDIO]" then
+                                pcall(function() k:FireServer(name) end)
+                                return
+                            end
+                        end
+                    end
+
+                    -- ── Remote lookup helper ──────────────────────────────────────────────
+                    local function findRemote(originalName)
+                        for k, item in pairs(data) do
+                            if item.OriginalName == originalName then
+                                return k
+                            end
+                        end
+                        return nil
+                    end
+
+                    -- ── Main farm procedure ───────────────────────────────────────────────
+                    local farmCooldown = false
+
+                    function startproc()
+                        if farmCooldown then return end
+                        farmCooldown = true
+                        task.delay(1, function() farmCooldown = false end)
+
+                        if not textBox then return end
+
+                        local num
+                        if not datatable.serverhop then
+                            num = tonumber(textBox.Text)
+                            if not num or num <= 0 then
+                                updatetext("enter a valid number!")
+                                task.delay(2, function() updatetext("enter slaps amount below") end)
+                                textBox.Text = ""
+                                return
+                            end
+                            -- Fix: cap at 10,000,000 instead of 20,001
+                            if num > MAX_SLAPS then
+                                updatetext("capped at 10,000,000 slaps")
+                                num = MAX_SLAPS
+                                textBox.Text = tostring(MAX_SLAPS)
+                                task.delay(2, function() updatetext("enter slaps amount below") end)
+                                return
+                            end
+                        else
+                            num = datatable.slaps
+                        end
+
+                        -- Optionally destroy GUI during farm for performance
+                        if no_gui_during_farm then
+                            updateInstancePropertiesFlag = false
+                            if screenGui then
+                                screenGui:Destroy()
+                                screenGui   = nil
+                                frame       = nil
+                                valueLabel  = nil
+                                secondaryParent = nil
+                                textBox     = nil
+                                startButton = nil
+                                textLabel   = nil
+                                progressLabel = nil
+                            end
+                            updateInstancePropertiesFlag = true
+                        end
+
+                        text  = "processing"
+                        slaps = math.floor(num)
+
+                        if secondaryParent then secondaryParent.Visible = false end
+                        if startButton     then startButton.Visible     = false end
+                        if textLabel       then
+                            textLabel.Text = "◆ cool slap farm by nexer ( netzach edition ) ◆"
+                        end
+
+                        local SlapsValue = LocalPlayer.leaderstats.Slaps.Value
+                        game.StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList, false)
+
+                        -- Validate _NETWORK folder exists
+                        if not game:GetService("ReplicatedStorage"):FindFirstChild("_NETWORK") then
+                            LocalPlayer:Kick("Failed to find _NETWORK folder")
+                            return
+                        end
+
+                        -- ── Step 1: Find glove select remote ─────────────────────────────
+                        if sendK == nil then
+                            updatetext("fetching remotes... (1/3, may take up to 30 seconds)")
+
+                            local capturedV = nil
+                            for _, item in next, game:GetService("ReplicatedStorage")._NETWORK:GetChildren() do
+                                if item and item.Name:find("{") and item:IsA("RemoteEvent") then
+                                    -- Probe by toggling glove and detecting the change
+                                    if LocalPlayer.leaderstats.Glove.Value == "Pull" then
+                                        item:FireServer("Stilts")
+                                        task.wait(2)
+                                        if LocalPlayer.leaderstats.Glove.Value == "Stilts" then
+                                            capturedV = item
+                                            break
+                                        end
+                                    else
+                                        item:FireServer("Pull")
+                                        task.wait(2)
+                                        if LocalPlayer.leaderstats.Glove.Value == "Pull" then
+                                            capturedV = item
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+
+                            if capturedV then
+                                function sendK(arg) capturedV:FireServer(arg) end
+                            else
+                                -- Fallback: search obfuscated data table
+                                updatetext("fetching remotes... (1/3, fallback mode)")
+                                function sendK(arg)
+                                    local remote = findRemote("SelectGlove [STUDIO]")
+                                    if remote then
+                                        pcall(function() remote:FireServer(arg) end)
+                                    end
+                                end
+                            end
+                        else
+                            updatetext("fetching remotes... (1/3)")
+                            task.wait(1)
+                        end
+
+                        -- ── Step 2: Setup + teleport ──────────────────────────────────────
+                        game:GetService("RunService"):Set3dRenderingEnabled(false)
+                        updatetext("processing... (2/3, 16 steps left)")
+
+                        local Character        = LocalPlayer.Character
+                        local HumanoidRootPart = Character:WaitForChild("HumanoidRootPart", 3601)
+                        local Humanoid         = Character:WaitForChild("Humanoid", 3601)
+                        local zeroVec          = Vector3.new(0, 0, 0)
+
+                        zeroVelocity(Character)
+                        HumanoidRootPart:PivotTo(CFrame.new(-17920, 120, 3560))
+                        task.wait(1)
+
+                        -- Step: equip Counter glove
+                        updatetext("processing... (2/3, 15 steps left)")
+                        sendK("Counter")
+                        repeat task.wait() until LocalPlayer.leaderstats.Glove.Value == "Counter"
+
+                        -- Step: enter arena
+                        updatetext("processing... (2/3, 14 steps left)")
+                        repeat
+                            task.wait()
+                            if Character:FindFirstChild("isInArena")
+                                and Character.isInArena.Value == false
+                            then
+                                local counterRemote = findRemote("Counter")
+                                if counterRemote then
+                                    pcall(function() counterRemote:FireServer() end)
+                                    task.wait(1)
+                                end
+                            end
+                        until Character:FindFirstChild("isInArena")
+                            and Character.isInArena.Value == true
+
+                        -- Step: equip el gato
+                        updatetext("processing... (2/3, 13 steps left)")
+                        sendK("el gato")
+                        repeat task.wait() until LocalPlayer.leaderstats.Glove.Value == "el gato"
+
+                        -- Step: activate cat (retry until workspace cat appears)
+                        updatetext("processing... (2/3, 12 steps left)")
+                        local catRemote = findRemote("Cat")
+                        repeat
+                            task.wait()
+                            if catRemote then
+                                pcall(function() catRemote:FireServer() end)
+                            end
+                        until workspace:FindFirstChild(LocalPlayer.Name .. "'s cat")
+
+                        -- Step: GeneralAbility (with retry on timeout)
+                        updatetext("processing... (2/3, 11 steps left)")
+                        local abilityRemote = findRemote("GeneralAbility")
+                        local innerRetry    = false
+                        repeat
+                            task.wait()
+                            if abilityRemote then
+                                pcall(function() abilityRemote:FireServer() end)
+                            end
+                            if not innerRetry then
+                                updatetext("processing... (2/3, 10 steps left)")
+                            end
+                            local ts = tick()
+                            repeat task.wait() until Character:FindFirstChild("Reversed") or tick() - ts >= 4
+                            if not Character:FindFirstChild("Reversed") then
+                                updatetext("processing... (2/3, unexpected error at step 10, retrying)")
+                                innerRetry = true
+                                task.wait()
+                            end
+                        until Character:FindFirstChild("Reversed")
+
+                        -- Step: equip Replica
+                        updatetext("processing... (2/3, 9 steps left)")
+                        sendK("Replica")
+                        repeat task.wait() until LocalPlayer.leaderstats.Glove.Value == "Replica"
+
+                        -- Step: Duplicate
+                        updatetext("processing... (2/3, 8 steps left)")
+                        local dupRemote = findRemote("Duplicate")
+                        if dupRemote then
+                            pcall(function() dupRemote:FireServer() end)
+                        end
+
+                        updatetext("processing... (2/3, 7 steps left)")
+                        repeat
+                            task.wait()
+                        until workspace:FindFirstChild("Å" .. LocalPlayer.Name)
+                            and workspace["Å" .. LocalPlayer.Name]:FindFirstChild("Head")
+                            and workspace["Å" .. LocalPlayer.Name]:FindFirstChild("HumanoidRootPart")
+
+                        -- Step: equip Reaper
+                        updatetext("processing... (2/3, 6 steps left)")
+                        sendK("Reaper")
+                        repeat task.wait() until LocalPlayer.leaderstats.Glove.Value == "Reaper"
+                        task.wait(0.5)
+
+                        -- Step: collision bypass + wait for tool
+                        updatetext("processing... (2/3, 5 steps left)")
+                        zeroVelocity(Character)
+                        updateCanCollide(Character, HumanoidRootPart)
+                        repeat
+                            task.wait()
+                        until Character:FindFirstChildWhichIsA("Tool")
+                            or LocalPlayer.Backpack:FindFirstChildWhichIsA("Tool")
+
+                        -- Destroy the tool (it's not needed)
+                        local tool = Character:FindFirstChildWhichIsA("Tool")
+                            or LocalPlayer.Backpack:FindFirstChildWhichIsA("Tool")
+                        if tool then pcall(function() tool:Destroy() end) end
+
+                        -- Step: launch to farm position
+                        updatetext("processing... (2/3, 4 steps left)")
+                        local launchEnd = tick() + 1.5
+                        while tick() < launchEnd do
+                            zeroVelocity(Character)
+                            HumanoidRootPart:PivotTo(CFrame.new(20000, 5000, 20000))
+                            task.wait()
+                        end
+
+                        updatetext("processing... (2/3, 3 steps left)")
+                        HumanoidRootPart.Anchored = true
+
+                        -- ── Step 3: Fire ReaperHit for all slaps ──────────────────────────
+                        -- Fix: original had no task.wait() — pure synchronous loop caused
+                        --      throttle/crash. Now batches with task.wait() every N hits.
+                        updatetext("processing... (2/3, 2 steps left)")
+                        local reaperHitRemote = findRemote("ReaperHit")
+
+                        if reaperHitRemote then
+                            local cloneName     = "Å" .. LocalPlayer.Name
+                            local cloneModel    = workspace:FindFirstChild(cloneName)
+                            local cloneHRP      = cloneModel and cloneModel:FindFirstChild("HumanoidRootPart")
+
+                            -- Batch size: fire N times per frame to maximize speed
+                            -- while keeping Roblox from throttling the connection.
+                            -- 50 per batch is empirically safe; adjust down if kicks occur.
+                            local BATCH_SIZE = 50
+                            local fired      = 0
+
+                            updateprogress("0 / " .. tostring(slaps) .. " slaps fired")
+
+                            for i = 1, slaps do
+                                -- Refresh clone reference in case it moved
+                                if i % 200 == 0 then
+                                    cloneModel = workspace:FindFirstChild(cloneName)
+                                    cloneHRP   = cloneModel and cloneModel:FindFirstChild("HumanoidRootPart")
+                                end
+
+                                if cloneModel and cloneHRP then
+                                    pcall(function()
+                                        reaperHitRemote:FireServer(cloneHRP)
+                                    end)
+                                    fired = fired + 1
+                                end
+
+                                -- Batch yield: prevents throttle and allows game to process
+                                if i % BATCH_SIZE == 0 then
+                                    updateprogress(tostring(fired) .. " / " .. tostring(slaps) .. " slaps fired")
+                                    task.wait()
+                                end
+                            end
+
+                            updateprogress(tostring(fired) .. " / " .. tostring(slaps) .. " — done firing")
+                        else
+                            updatetext("ERROR: ReaperHit remote not found")
+                            task.wait(3)
+                        end
+
+                        -- Step: reset to register hits
+                        task.wait(0.5)
+                        pcall(function() LocalPlayer.Reset:FireServer() end)
+
+                        if slaps >= 10000 then
+                            updatetext("processing... (2/3, 1 step left, registering hits — may take a while for large amounts)")
+                        else
+                            updatetext("processing... (2/3, 1 step left, registering hits)")
+                        end
+
+                        repeat task.wait() until Humanoid.Health == 0
+
+                        -- ── Post-farm: serverhop or idle ──────────────────────────────────
+                        if not datatable.serverhop then
+                            updatetext("processing... (2/3, 0 steps left, waiting for respawn)")
+                            LocalPlayer.CharacterAdded:Once(function()
+                                task.wait(0.5)
+                                text = "idle"
+                                task.spawn(function()
+                                    pcall(function() EquipGlove("Default") end)
+                                end)
+                                updatetext("processed. (3/3) ✓")
+                                updateprogress("")
+                                task.wait(1)
+                                game:GetService("RunService"):Set3dRenderingEnabled(true)
+                                game.StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.PlayerList, true)
+                                Hide()
+                                if Sound then Sound:Stop(); Sound:Destroy(); Sound = nil end
+                                restoreAllSounds()
+                                pcall(function() LocalPlayer.leaderstats.Glove.Value = "Default" end)
+                            end)
+                            return
+                        end
+
+                        -- Serverhop path: wait for slaps to register then hop
+                        updatetext("processing... (2/3, 0 steps left, waiting for slaps to register)")
+                        local lastChangeTime = tick()
+                        local slapsChangedConn = LocalPlayer.leaderstats.Slaps
+                            :GetPropertyChangedSignal("Value")
+                            :Connect(function() lastChangeTime = tick() end)
+
+                        repeat
+                            task.wait(0.1)
+                        until LocalPlayer.leaderstats.Slaps.Value >= SlapsValue + slaps - 1
+                            or tick() - lastChangeTime >= datatable.slap_gain_ended_trigger
+
+                        slapsChangedConn:Disconnect()
+
+                        updatetext("processed. (3/3, serverhopping...)")
+                        pcall(function()
+                            EquipGlove("Default")
+                            pcall(function() LocalPlayer.leaderstats.Glove.Value = "Default" end)
+                        end)
+
+                        -- ── Serverhop: find smallest server and join ──────────────────────
+                        task.spawn(function()
+                            local PlaceId       = game.PlaceId
+                            local hours         = {}
+                            local nextCursor    = ""
+                            local currentHour   = os.date("!*t").hour
+                            local HttpService   = game:GetService("HttpService")
+
+                            -- Load visited-server list from file
+                            pcall(function()
+                                local raw = readfile("SmallServerServerHop-Nexer1234.json")
+                                local decoded = HttpService:JSONDecode(raw)
+                                hours = decoded
+                            end)
+
+                            -- Add current hour marker
+                            local function addHourIfNew()
+                                local found = false
+                                for _, h in ipairs(hours) do
+                                    if tonumber(h) == currentHour then found = true; break end
+                                end
+                                if not found then
+                                    table.insert(hours, currentHour)
+                                    pcall(function()
+                                        writefile("SmallServerServerHop-Nexer1234.json",
+                                            HttpService:JSONEncode(hours))
+                                    end)
+                                end
+                            end
+                            addHourIfNew()
+
+                            local function fetchServers()
+                                local url = "https://games.roblox.com/v1/games/"
+                                    .. PlaceId
+                                    .. "/servers/Public?sortOrder=Asc&limit=100"
+                                if nextCursor ~= "" then
+                                    url = url .. "&cursor=" .. nextCursor
+                                end
+                                local ok, result = pcall(function()
+                                    return HttpService:JSONDecode(game:HttpGet(url))
+                                end)
+                                if not ok then return end
+
+                                if result.nextPageCursor
+                                    and result.nextPageCursor ~= "null"
+                                    and result.nextPageCursor ~= nil
+                                then
+                                    nextCursor = result.nextPageCursor
+                                end
+
+                                for _, server in pairs(result.data or {}) do
+                                    local id      = tostring(server.id)
+                                    local maxPl   = tonumber(server.maxPlayers)
+                                    local playing = tonumber(server.playing)
+
+                                    if maxPl and playing and maxPl > playing then
+                                        -- Skip already-visited servers
+                                        local visited = false
+                                        for _, h in ipairs(hours) do
+                                            if tostring(h) == id then visited = true; break end
+                                        end
+
+                                        if not visited then
+                                            table.insert(hours, id)
+                                            pcall(function()
+                                                writefile("SmallServerServerHop-Nexer1234.json",
+                                                    HttpService:JSONEncode(hours))
+                                                task.wait()
+                                                game:GetService("TeleportService")
+                                                    :TeleportToPlaceInstance(PlaceId, id, LocalPlayer)
+                                            end)
+                                            task.wait(4)
+                                        end
+                                    end
+                                end
+                            end
+
+                            -- Keep scanning until teleport succeeds
+                            while task.wait(0.5) do
+                                pcall(fetchServers)
+                            end
+                        end)
+
+                        task.wait(900000)
+                        return
+                    end
+
+                    -- ── AntiCheat bypass loadstring ───────────────────────────────────────
+                    pcall(function()
+                        loadstring(
+                            'local RequireService = function(clone) return clone end\n'
+                            .. 'local BlockInstance = function(e) e.Name = "BlockedInstance_"..math.random(0,500000) e.Parent = RequireService(game:GetService("LogService")) e:Destroy() end\n'
+                            .. 'local Players = RequireService(game:GetService("Players"))\n'
+                            .. 'local Player = Players.LocalPlayer\n'
+                            .. 'local ReplicatedStorage = RequireService(game:GetService("ReplicatedStorage"))\n'
+                            .. 'local ReplicatedFirst = RequireService(game:GetService("ReplicatedFirst"))\n'
+                            .. 'local StarterPlayer = RequireService(game:GetService("StarterPlayer"))\n'
+                            .. 'local StarterPlayerScripts = StarterPlayer:WaitForChild("StarterPlayerScripts")\n'
+                            .. 'if ReplicatedFirst and ReplicatedFirst:FindFirstChild("Client") and ReplicatedFirst.Client:FindFirstChild("GrabLocal") then BlockInstance(game.ReplicatedFirst.Client.GrabLocal) end\n'
+                            .. 'if StarterPlayerScripts and StarterPlayerScripts:FindFirstChild("ClientAnticheat") then BlockInstance(StarterPlayerScripts.ClientAnticheat.AntiMobileExploits) BlockInstance(StarterPlayerScripts.ClientAnticheat) end\n'
+                            .. 'for _, name in ipairs({"Ban","WalkSpeedChanged","AdminGUI","GRAB","SpecialGloveAccess"}) do if game:GetService("ReplicatedStorage"):FindFirstChild(name) then BlockInstance(game:GetService("ReplicatedStorage"):FindFirstChild(name)) end end\n'
+                        )()
+                    end)
+
+                    Hint:Destroy()
+                    Show()
+
+                    if datatable.serverhop then
+                        task.wait()
+                        startproc()
+                    end
+
+                    startButton.MouseButton1Click:Connect(startproc)
+                    textBox.FocusLost:Connect(function(enterPressed)
+                        if enterPressed then startproc() end
+                    end)
+
+                    -- "Farm again" button via PopBalloons clone
+                    local clone = LocalPlayer.PlayerGui.PopBalloons:Clone()
+                    for _, item in next, clone.Button:GetChildren() do
+                        if not item:IsA("TextLabel") then item:Destroy() end
+                    end
+                    clone.ResetOnSpawn = false
+                    clone.Button.TextLabel.Text = "Click me to farm slaps again"
+                    clone.Button.MouseButton1Click:Connect(function()
+                        text = "idle"
+                        if not screenGui or not screenGui.Parent then
+                            screenGui   = nil
+                            frame       = nil
+                            valueLabel  = nil
+                            secondaryParent = nil
+                            textBox     = nil
+                            startButton = nil
+                            textLabel   = nil
+                            progressLabel = nil
+                            createFullScreenCover()
+                        end
+
+                        if not Sound then
+                            muteAllSounds()
+                            Sound = Instance.new("Sound")
+                            Sound.SoundId      = "rbxassetid://121910554823324"
+                            Sound.TimePosition = 7.2
+                            Sound:GetPropertyChangedSignal("TimePosition"):Connect(function()
+                                if Sound.TimePosition < 7.2 or Sound.TimePosition > 290 then
+                                    Sound.TimePosition = 7.2
+                                end
+                            end)
+                            Sound.Volume = 1
+                            Sound.Parent = game:GetService("SoundService")
+                            Sound.Looped = true
+                            Sound:Play()
+
+                            soundConnection = workspace.DescendantAdded:Connect(function(desc)
+                                if desc:IsA("Sound") then
+                                    task.wait()
+                                    if desc.IsPlaying then
+                                        if not updateInstancePropertiesData[desc] then
+                                            updateInstancePropertiesData[desc] = {
+                                                desc.Volume, desc.IsPlaying, desc.TimePosition
+                                            }
+                                        end
+                                        desc.Volume  = 0
+                                        desc.Playing = false
+                                    end
+                                end
+                            end)
+                            workspace.DescendantRemoving:Connect(function(desc)
+                                if desc:IsA("Sound") then
+                                    updateInstancePropertiesData[desc] = nil
+                                end
+                            end)
+                        end
+
+                        if secondaryParent then secondaryParent.Visible = true end
+                        if startButton then
+                            startButton.Visible          = true
+                            startButton.BackgroundColor3 = alternateBackgroundColor
+                            startButton.MouseButton1Click:Connect(startproc)
+                        end
+                        if textLabel then
+                            textLabel.Text = "◆ cool slap farm by nexer ( netzach edition ) ◆"
+                        end
+                        if textBox then
+                            textBox.FocusLost:Connect(function(ep) if ep then startproc() end end)
+                        end
+                        updatetext("enter slaps amount below")
+                        updateprogress("")
+                        Show()
+                    end)
+                    clone.Parent   = game:GetService("CoreGui")
+                    clone.Enabled  = true
+
+                    return
+
+                end -- character/entered check
+                LocalPlayer:Kick("You need to use this script in lobby")
+                return
+            end -- Counter glove check
+            LocalPlayer:Kick("You need to have 'Counter' glove (Not rented)")
+            return
+        end -- slap count check
+        LocalPlayer:Kick("You need at least 12000 slaps to use this script (Wormhole glove)")
+        return
+    end -- PlaceId check
+    LocalPlayer:Kick("You can't use this script in no oneshots, use in island swap instead")
+    return
+end
+
+LocalPlayer:Kick("Can't execute this script twice")
